@@ -1,0 +1,8 @@
+# 启动或复用 ssh-agent
+if ! pgrep -u "$USER" ssh-agent >/dev/null; then
+  eval "$(ssh-agent -s)"
+fi
+
+# 若未加载任何key，则加载你的key
+ssh-add -l >/dev/null 2>&1 || ssh-add /root/.ssh/id_ed25519
+
