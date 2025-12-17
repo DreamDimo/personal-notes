@@ -475,6 +475,7 @@ gen_batch_output.non_tensor_batch = {
 ```
 
 **为什么需要 `interleave=True`?**
+
 - 保证同一个 prompt 的 5 个回答在 batch 中是连续的
 - 方便后续按 uid 分组
 
