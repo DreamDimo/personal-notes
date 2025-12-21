@@ -7,6 +7,30 @@
 
 ---
 
+## 0. 个人总结
+
+因为美国购物网站非常多，有几百个，但是想要开发一个通用的爬虫程序来应对不同的网站较为困难，因为不同的网站可能元素会对应不同的选择器。
+
+所以我们是先对多个网站手动开发，试图寻找它们的共性。我们发现一个网站的爬虫大概是要分成几步，对于手动开发：
+
+* 首先我们需要去打开一个网页，第一个页面一定是主页，我们需要提取它里面的url链接，一般是通过开发者工具确定几个元素，然后根据元素提取url。
+* 下一步就是分析这些url，对这些url进行分类，它们可能对应详情页，列表页和其他页面，我们需要对它们进行分类。
+* 之后根据分类，对于列表页，我们需要模仿主页提取规则继续提取有效的url链接；
+* 对于详情页，我们需要首先获取到 $html$ ，通常需要滚动页面来触发渲染。对于评论或者内容字段有些为动态加载，需要通过ajax技术获取，我们的方法是通过开发者工具得到请求 API，根据 api 去拦截请求得到全部的评论或者详情信息。获取后我们需要通过 $Beautifulsoup$ 对 html 进行格式转换。然后开始对 html 做一轮清理，清理掉网站头尾，然后移除非商品相关元素（包括推荐商品，广告，相关链接等），移除掉所有的 $script$ 代码，因为我们已经通过请求获取了，保留主要内容。之后利用元素标签提取对应的元素将其转换为 markdown 。
+* 对于提取到的商品图片，有些图片的文字对我们是有用的，比如化妆品、食品、保健品的配料表信息，我们需要利用 $OCR$ 技术去获取这些信息，我们采用的是对 $Qwen3-8b-VL$ 进行微调。因为我们发现该模型在处理小字的时候经常会出现幻觉，且输出内容质量较低，输出格式需要处理转换，因此我们对其进行微调，我们采集一些网站的图片主要是配料表信息，然后根据人工标注形成一套数据集，然后利用这个对模型进行微调，使其提高输出准确率，并能够知道我们需要的主要信息，之后模型的输出准确率都有了一定的提高。
+* 然后将图片解析的OCR信息和之前爬虫获取的markdown拼接起来，送入 $gemini$ 进行分析，根据设计的产品模型表信息，做具体的转换，这里主要是根据产品模型编写提示词，让大模型能够知道哪些需要转换以及怎么转换。其中这里有一步中间步骤，就是我们需要根据清洗后的markdown来确定具体的产品分类，它是属于食品还是衣物还是保健品等等，因为不同类别对应的产品模型不同。**TODO** 
+
+我们可以看出步骤上基本是一致的，可以考虑使用 $code \ agent$ 做开发，我们先用 $jinja2$ 给出一个大致的模版，即包括一个提取器类用来提取， 对于 $ai$ 辅助开发，有几个要点需要思考分析：
+
+* 我们打开网页并对网页进行分析，这个如何让 $agent$ 来操作？我们的思路是利用谷歌开发者 $mcp$ 工具即 $chrome\_devtools\_mcp$ 去分析页面，因为它可以快速查找指定元素的 $html$ 元素，对页面进行截图比对分析。同时要确认是否会遭遇反爬，如果遭遇反爬则启用 $brightdata$ 提取 $html$，即要确认引擎是只使用 $playwright$ 还是要结合使用 $brightdata$ 。还需要确定页面的渲染方式，是否有很多 $js$ 代码
+* 下面是生成列表提示器，我们提供一个基本的模版，然后给 $claude \ code$ 一些 $mcp$ 或者 $skills$，让它能够生成对应的列表提取器，我们给的提示词是用 `chrome_devtools` 分析页面，然后代码中使用 `playwright` ，去网页注入一个 `js` 脚本去提取所有的链接，然后将 url 存入 state 里面的 `site_tree` 字段。
+* 我们需要对提取到的 `url` 进行进一步的分类，我们需要把它们分为列表页、详情页、不确定页、其他页面（通过设计提示词告诉每种页面的一些规则，分类这里我们使用更便宜的 gemini 提供的 mcp 去处理）。然后我们对每一个分类的 `url` 通过正则表达式设计一些匹配规则，即识别出一些 `pattern` 模式，并且利用我们自定义的工具去检查这些模式是否正确（即检查有没有url和其匹配），我们将识别出的 `pattern` 放入 state 中的 `site_pattern` 字段，然后写入到代码里面，按照上面四个分类把它们分成不同的 `patterns` 。这一步可能需要多轮，第一轮结束后要检查有没有 `url` 没有被匹配到，然后重新匹配这些 url。 对于不确定的页面我们通过设计提示词增加一轮来进一步分析其属于的范围。然后更新 `site_tree` 字段。这里我们也设计了工具，去随机抽取一些 url 检查 url 分类是否准确，判断方法是用谷歌开发者工具去打开网页然后判断
+* 之后我们从每个 patterns 里面找一些 `sample_url` ，然后根据分类进入不同的详情页提取和列表页提取分析。对于详情页，我们也是先用 `chrome-devtools` 对样例页进行分析，首先通过谷歌开发者工具将其滑动到底部然后等待看是否会有反爬，如果有反爬我们使用 brigthdata先获取页面，然后用谷歌开发者工具读取这个临时的 html 文件，然后我们需要对页面滚动然后进行截图，截图需要我们自定义的工具进行压缩。截图的目的是让 ai 比较通过 html 分析得到的结果和截图进行比较分析，并给出一些问题让 ai 进行分析（页面的布局，头栏底栏在哪，有无公告；内容定位，主商品图片，商品介绍，是否通过js等）。分析完成后输出到注释里面，然后根据注释去制作一个详情页提取类，包括多个步骤，即获取 html，清理并转换，然后如果有的是通过 `ajax` 去服务器读取的，我们可以通过发送 `get_ajax_comment` 来根据 api 请求获取到想要的信息。
+* 然后就是我们需要增加树的深度，即需要不断扩展 url，因为我们提取到的列表页可能包含其他列表页，所以需要不断扩展，这里就是重复执行上述的步骤。执行完后我们让模型对所有方法进行检查，检查一下几个关键地方是否生成。然后让模型测试，得到时长，即记录一下需要多久才能执行完这方法，然后通过这个去对耗时长的方法去优化。
+* 同时为了保证代码的质量，我们在每一步后都会加入一个 `review nodes` 这个是另一个 `subagent` ，会去检查每一步生成是否满足要求，这个主要是我们进行一些正则表达式检查（需要生成的方法或者类或者属性是否存在），然后去执行代码对返回结果进行分析，是否有报错，是否有返回结果等。在前期我们会加入 `human-in-loop` 去检查一些中间文件，比如列表页提取到的列表文件，详情页的html文件等，后面待提示词修复完善，测试命令完善后我们删除了这一部分，最大可能的保证系统全部自动化运行。同时我们接入了 `slack boot` ，当开发出现问题时能够自动向我们的工作区发布警告，然后人来审核修复。
+
+这里我们用的就是 $LangGraph$ 进行工作流的设计，然后用其中的 `checkpoint` 机制去保存每一步的信息，然后用 `git` 去实现自动提交代码，这样我们就可以实现从某一步恢复重做等方法。我们利用的 `code agent` 就是 `claude code` ，因为它具有 `mcp` 、`skills` 以及记忆等能力，同时我们用全局的 client 防止重复创建，然后我们通过 hook 事件批准一些工具的使用，用session_id保持一轮会话的一致性，然后具体的使用方法可以详见大模型开发中的 `claude code` 。
+
 ## 1. 项目概述
 
 ### 1.1 项目定位
@@ -1110,1012 +1134,346 @@ DevBot 共有 **28 个 Developer 节点** (包括子步骤)，分为 4 大阶段
     Step 22: 修复代码
 ```
 
-### 5.1 阶段 1: 基础框架
+本文档详细分析 DevBot 爬虫开发系统中每个开发节点(developer_nodes)的设计思路和实现逻辑。
 
-#### 5.1.1 Step 0: 创建基础文件
+### 5.1 总体架构
 
-**目标**: 从 Jinja2 模板生成爬虫代码骨架。
+DevBot 采用 LangGraph 构建的声明式工作流，通过 StateGraph 管理状态流转。整个系统分为主线开发流程(Step 0-10)和代码质量检测流程(Step 20-22)。
 
-**输入**:
+### 5.2 核心设计理念
 
-- `state["url"]`: 目标网站 URL
-- `state["site_name"]`: 网站名称
-- `state["category"]`: 爬虫分类
-
-**执行流程**:
-
-```python
-# developer_nodes.py:260-301
-async def step0__create_base_file(state: CrawlerDevState) -> CrawlerDevState:
-    # 1. 读取模板
-    with open(BASE_PATH / 'tmpl_base.py.j2', 'r') as f:
-        base_content_template = f.read()
-
-    # 2. 渲染模板
-    base_content = jinja2.Template(base_content_template).render(
-        site_capitalize=state["site_name"].capitalize(),
-        site_name=state["site_name"],
-        entry_url=state["url"],
-        category=state["category"]
-    )
-
-    # 3. 备份已存在的文件
-    output_file = Path(state["base_file_path"])
-    if output_file.exists():
-        nowtime = datetime.now().strftime("%Y%m%d%H%M")
-        backup_file = f"{output_file}.bak.{nowtime}"
-        os.rename(output_file, backup_file)
-        logger.info(f"已备份现有文件到: {backup_file}")
-
-    # 4. 写入文件
-    with open(output_file, 'w', encoding='utf-8') as f:
-        f.write(base_content)
-
-    logger.info(f"✅ 基础文件已创建: {output_file}")
-
-    # 5. 创建必要的目录
-    for _, folder in get_need_dirs(state).items():
-        folder.mkdir(parents=True, exist_ok=True)
-
-    # 6. Git 提交 (如果启用)
-    auto_commit_if_enabled(state, "step0__create_base_file", "创建基础 extractor 文件框架")
-
-    # 7. 返回更新后的 state
-    return {
-        **state,
-        "current_step": "0",
-        "current_step_name": "create_base_file",
-        "status": "completed",
-        "result": str(output_file)
-    }
-```
-
-**生成的文件结构**:
-
-```python
-# crawler/product/extractor_gnc.py (示例)
-from crawler.base.extractor_base import BaseExtractor, PageParam
-
-SITE_HOST = 'gnc'
-ENTRY_URL = 'https://www.gnc.com'
-
-CONCURRENT_CONFIG = {
-    'pool_size': 3,
-    'tab_size': 5,
-    'delay_between_requests': 1.0,
-    'use_brightdata': False,
-    'brightdata_batch_size': 20,
-}
-
-class BaseGncExtractor(BaseExtractor):
-    engine = 'browser_pool'
-    concurrent_config = CONCURRENT_CONFIG
-
-async def extract_deals_from_mainpage(page: Optional[Union[str, PageParam]] = None) -> dict:
-    """TODO: 从网站提取商品/活动/优惠/列表，及网页基本信息"""
-    pass
-
-# ... 更多 TODO 方法
-```
-
-**潜在问题**:
-
-- **文件已存在**: 备份机制自动处理
-- **目录权限**: 确保写入权限
-
-**下一步**: `review_step0` 验证文件可导入
+1. **渐进式构建**: 从基础框架到完整功能，逐步生成爬虫代码
+2. **AI驱动**: 每个步骤调用 Claude AI 生成特定代码片段
+3. **断点续传**: 通过状态持久化支持从任意节点恢复
+4. **自动提交**: 每个步骤完成后自动 Git 提交，便于追踪
+5. **循环处理**: 支持处理多个 URL patterns 的循环
+6. **质量保证**: 内置代码检查和性能优化流程
 
 ---
 
-#### 5.1.2 Step 1: 分析页面结构
+### 5.3 主线开发流程 (Step 0-10)
 
-**目标**: 用 chrome-devtools 访问网站，分析页面复杂度，选择合适的引擎和并发参数。
+#### Step 0: 创建基础文件 (`step0__create_base_file`)
 
-**Prompt 模板** (简化版):
+**设计思路**:
 
-```jinja2
-# developer_nodes.py:306-374
-用 chrome-devtools 访问以下电商/优惠网站，截图读页面内容，分析页面结构并为爬虫选择合适的引擎和并发参数：
+- 使用 Jinja2 模板(`tmpl_base.py.j2`)生成爬虫文件骨架
+- 创建必要的目录结构
+- 提供基础的类定义和配置框架
 
-代码文件: {{base_file_path}}
-网址: {{ url }}
-中间文件存放位置: {{ tmp_folder }}/
-
-请按顺序执行任务：
-1. 用 chrome-devtools 打开网站，如遇反爬，先使用 brightdata 保存临时页面，再用 chrome-devtools 访问这个临时 html 页。
-2. 读取所有的商品列表页 url (包括 banner、活动、优惠等各类页面)，存为 {{ tmp_folder }}/first_analyze.json
-3. 对页面截长图并保存
-   - 使用 chrome-devtools 的 take_screenshot 工具
-   - 必须设置参数: format="jpeg", fullPage=true, filename=mainpage_long_screenshot.jpg
-   - 文件路径（移动到此）: {{ output_part_dir }}/mainpage_long_screenshot.jpg
-   - 如果图片超过了 2 MB 或单边像素超过了 8000，执行以下命令压缩图片:
-     ```python -m devbot.tool compress_image {{ output_part_dir }}/mainpage_long_screenshot.jpg {{ output_part_dir }}/mainpage_long_screenshot.webp```
-
-4. 从截图读出页面商品/活动/优惠数量，并与 first_analyze.json 文件作比较分析
-5. 从页面代码分析页面复杂度 (simple: 静态 HTML, medium: 部分 JS 渲染, complex: 大量 JS/动态加载)
-6. 分析页面的动态数据加载情况（通过 chrome-devtools 的 list_network_requests 查看 xhr/fetch 请求）
-7. 将以上分析结果以最简短语言写在代码中 CONCURRENT_CONFIG 下方首页分析注释当中（格式：`"""首页分析: ...内容... """`）
-8. 推荐爬虫引擎类型
-   - **browser_pool**: 用 playwright 打开页面能正常访问时选择（更便宜，优先考虑）
-   - **brightdata+browser_pool**: 反爬阻止访问且无法简单解决时选择
-9. 推荐的并发配置参数
-10. 修改代码以设置上引擎和并发参数
-```
-
-**执行示例**:
+**关键实现**:
 
 ```python
-# developer_nodes.py:382-403
-async def step1__analyze_page(state: CrawlerDevState) -> CrawlerDevState:
-    """Step 1: 用 chrome-devtools 分析页面结构, 选择合适的引擎和参数"""
-
-    # 1. 渲染 prompt
-    prompt = get_step_prompt('step1', state)
-
-    # 2. 调用 crawler-developer agent
-    result = await call_subagent('crawler-developer', prompt, session_id=state.get("session_id"))
-
-    response_text = result.get("message", "")
-    new_session_id = result.get("session_id")
-
-    # 3. 保存对话历史
-    save_conversation_from_state(
-        state=state, prompt=prompt, response=response_text,
-        node_name="step1_analyze_page_structure",
-        metadata={"agent": "crawler-developer"}
-    )
-
-    # 4. Git 提交
-    auto_commit_if_enabled(state, "step1__analyze_page", "分析页面结构并生成初步代码")
-
-    # 5. 返回更新后的 state
-    return {
-        **state,
-        "session_id": new_session_id,  # 保存 session_id
-        "current_step": "1",
-        "current_step_name": "analyze_page_structure",
-        "status": "completed",
-        "result": response_text
-    }
+- 读取模板文件 tmpl_base.py.j2
+- 渲染模板，填充站点名、URL、分类等参数
+- 生成 extractor_{site_name}.py 文件
+- 创建 output_dir、output_part_dir、tmp_folder 等目录
+- 自动 Git 提交
 ```
 
-**输出示例** (修改后的代码):
+**输出产物**:
 
-```python
-# crawler/product/extractor_gnc.py
-CONCURRENT_CONFIG = {
-    'pool_size': 3,
-    'tab_size': 5,
-    'delay_between_requests': 0.5,
-    'use_brightdata': False,
-    'brightdata_batch_size': 20,
-}
-
-"""首页分析:
-- 页面复杂度: medium (部分 JS 渲染)
-- 商品数量: 约 48 个
-- 动态加载: 评论通过 AJAX 加载，商品列表静态渲染
-- 反爬情况: 无明显反爬
-- 推荐引擎: browser_pool
-- 临时文件: /tmp/scraper/first_analyze.json
-- 截图文件: crawler/product/output/gnc/mainpage_long_screenshot.webp
-"""
-
-class BaseGncExtractor(BaseExtractor):
-    engine = 'browser_pool'  # ✅ 已设置
-    concurrent_config = CONCURRENT_CONFIG
-```
-
-**潜在问题**:
-
-| 问题           | 表现                                         | 解决方案                                      |
-| -------------- | -------------------------------------------- | --------------------------------------------- |
-| 反爬阻止访问   | chrome-devtools 打开页面显示 Cloudflare 验证 | Prompt 要求先用 `save_tmp_page_by_brightdata` |
-| 截图过大       | DecompressionBombError                       | Prompt 要求压缩图片                           |
-| 截图未完全加载 | 截图像素异常（超过 1 亿）                    | Prompt 要求重试最多 5 次                      |
-| 网络超时       | chrome-devtools 访问超时                     | 手动重试或检查网络                            |
-
-**下一步**: `review_step1` 验证代码可执行
+- `crawler/{category}/extractor_{site_name}.py` - 基础代码框架
+- 相关目录结构
 
 ---
 
-#### 5.1.3 Step 2: 生成列表提取器
+#### Step 1: 分析页面结构 (`step1__analyze_page`)
 
-**目标**: 实现 `extract_deals_from_mainpage` 方法，从主页提取商品/优惠列表。
+**设计思路**:
 
-**Prompt 核心要求**:
+- 使用 chrome-devtools 访问目标网站
+- 分析页面复杂度(静态/JS渲染/动态加载)
+- 选择合适的爬虫引擎和并发参数
+- 截取首页长图并压缩
+- 分析动态数据加载情况(AJAX、评论区、商品参数等)
 
-```jinja2
-# developer_nodes.py:407-523
-# 任务：实现列表提取器
+**核心任务**:
 
-## 代码文件
-`{{base_file_path}}`
+1. **反爬处理**: 如遇反爬，先用 BrightData 保存临时页面
+2. **页面分析**:
+   - 读取商品列表页 URL 保存到 `first_analyze.json`
+   - 截取首页长图(fullPage=true)
+   - 压缩图片到 2MB 以内(避免超过 API 限制)
+3. **动态数据分析**:
+   - 评论区加载方式(静态/AJAX/无限滚动)
+   - 商品参数获取方式
+   - 其他 AJAX 请求
+4. **引擎选择**:
+   - `browser_pool`: 无反爬或简单反爬
+   - `brightdata+browser_pool`: 复杂反爬
 
-## 当前任务
-根据 extract_deals_from_mainpage 方法注释，实现此方法，从页面提取出商品列表和页面基本信息。
+**Prompt 关键点**:
 
-## 参考代码
+```markdown
+- 截图要求: format="jpeg", fullPage=true
+- 压缩限制: 2MB 以内，单边像素不超过 8000
+- 重试机制: DecompressionBombError 最多重试 5 次
+```
+
+**输出产物**:
+
+- 代码中的"首页分析"注释
+- CONCURRENT_CONFIG 并发配置
+- Base{Site}Extractor 的 engine 设置
+- 首页长图截图文件
+
+---
+
+#### Step 2: 生成列表提取器 (`step2__generate_list_extractor`)
+
+**设计思路**:
+
+- 实现 `extract_deals_from_mainpage` 方法
+- 从首页提取商品/活动/优惠列表
+- 返回标准化的数据结构
+
+**关键要求**:
+
+1. **返回数据结构**:
 
 ```python
-async def extract_deals_from_mainpage(page: Optional[Union[str, PageParam]] = None) -> dict:
-    """从网站提取商品/活动/优惠/列表，及网页基本信息
-
-    Returns:
-        dict: 包含以下字段:
-            - urls(products/deals列表): List[dict] 商品列表,每个项包含:
-                - `type`: detail/list/other/unclear
-                - title: 标题
-                - url: 链接(以http打头的完整链接)
-                - image_url: 相关图片URL（仅detail类型可能有此字段）
-                - price: 价格（仅detail类型可能有此字段）
-    """
-    extractor = NewSiteListExtractor(page)
-    async with extractor.browser_pool.get_page() as pw_page:
-        if 'brightdata' in extractor.engine:
-            extractor.brightdata_file = await extractor.save_origin_html_by_brightdata()
-            file_url = f'file://{Path(extractor.brightdata_file).resolve()}'
-            await pw_page.goto(file_url, wait_until='domcontentloaded', timeout=60000)
-        else:
-            await pw_page.goto(extractor.url, wait_until='domcontentloaded', timeout=60000)
-
-        await pw_page.wait_for_timeout(2000)  # 等待 JS 加载
-        extractor.html_content = await pw_page.content()
-        extractor.cache_html_content(extractor.html_content)
-
-        # TODO 从 pw_page 提取页面信息 urls等
-        # ...
-    return {}
-```
-
-## 测试修正
-
-1. 执行测试：
-
-   ```bash
-   python -m crawler.{{ category }}.extractor_{{site_name}} extract_deals_from_mainpage > {{ tmp_folder }}/extract_deals_from_mainpage.log
-   ```
-
-2. 验证结果：
-
-   - 比较提取的 {{ category }} 数量与首页分析中的数量
-   - 两者应该相符
-
-3. 问题修正：
-
-   - 如果数量不符，查看 chrome-devtools 打开的页面
-   - 分析错误原因并修正代码
-   - 重复测试直到达成目标
-
-```
-**执行流程**:
-
-```python
-# developer_nodes.py:567-644
-async def step2__generate_list_extractor(state: CrawlerDevState) -> CrawlerDevState:
-    """Step 2: 生成列表提取器 (extract_deals_from_mainpage)"""
-
-    # 1. 渲染 prompt
-    prompt = get_step_prompt('step2', state)
-
-    # 2. 调用 crawler-developer agent
-    result = await call_subagent('crawler-developer', prompt, session_id=state.get("session_id"))
-
-    response_text = result.get("message", "")
-    new_session_id = result.get("session_id")
-
-    # 3. 保存对话历史
-    save_conversation_from_state(state=state, prompt=prompt, response=response_text,
-                                 node_name="step2__generate_list_extractor",
-                                 metadata={"agent": "crawler-developer"})
-
-    # 4. 执行 extract_deals_from_mainpage 并创建 site_tree.json
-    cache_data = await create_site_tree(state, can_use_cache=False)
-
-    # 5. Git 提交
-    auto_commit_if_enabled(state, "step2__generate_list_extractor", "生成列表提取器")
-
-    # 6. 返回更新后的 state
-    return {
-        **state,
-        "session_id": new_session_id,
-        "current_step": "2",
-        "current_step_name": "generate_list_extractor",
-        "status": "completed",
-        "cache_data": cache_data,
-        "result": response_text
-    }
-```
-
-**create_site_tree 函数**:
-
-```python
-# developer_nodes.py:530-561
-async def create_site_tree(state: CrawlerDevState, can_use_cache=False) -> dict:
-    """执行 extract_deals_from_mainpage 并创建 site_tree.json
-
-    Returns:
-        dict: {'site_tree': urls} 格式的 cache_data
-    """
-    # 1. 动态导入模块
-    module_path = f'crawler.{state["category"]}.extractor_{state["site_name"]}'
-    if module_path in sys.modules:
-        del sys.modules[module_path]  # 强制重新加载
-
-    extractor_module = importlib.import_module(module_path)
-    func = getattr(extractor_module, 'extract_deals_from_mainpage')
-
-    # 2. 调用函数
-    res = await func()
-
-    # 3. 整理 URLs
-    urls = res.get('urls', [])
-    for item in urls:
-        item['from'] = state['url']  # 标记来源
-        item['level'] = 1 if item['url'] != state['url'] else 0  # 层级
-
-    cache_data = {'site_tree': urls}
-
-    # 4. 保存到文件
-    site_tree_file = get_need_dirs(state)['output_file_dir'] / 'site_tree.json'
-    site_tree_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(site_tree_file, 'w', encoding='utf-8') as f:
-        json.dump(cache_data, f, indent=2, ensure_ascii=False)
-
-    logger.info(f"✅ site_tree.json 已创建: {site_tree_file}，包含 {len(urls)} 个 URLs")
-
-    return cache_data
-```
-
-**输出示例** (site_tree.json):
-
-```json
 {
-  "site_tree": [
-    {
-      "title": "Vitamin C 1000mg",
-      "url": "https://www.gnc.com/vitamins/123.html",
-      "type": "detail",
-      "price": "$19.99",
-      "image_url": "https://www.gnc.com/images/123.jpg",
-      "from": "https://www.gnc.com",
-      "level": 1
-    },
-    {
-      "title": "Vitamin Category",
-      "url": "https://www.gnc.com/vitamins/",
-      "type": "list",
-      "from": "https://www.gnc.com",
-      "level": 1
-    }
-  ]
+    'site_name': str,
+    'title': str,
+    'content_length': int,
+    'detail_count': int,  # 详情页数量
+    'list_count': int,    # 列表页数量
+    'urls': [
+        {
+            'type': 'detail' | 'list' | 'other' | 'unclear',
+            'title': str,
+            'url': str,  # 完整URL (http开头)
+            'image_url': str,  # 可选，仅detail类型
+            'price': str       # 可选，仅detail类型
+        }
+    ]
 }
 ```
 
-**潜在问题**:
+2. **URL类型定义**:
+   - **detail**: 详情页 - URL含唯一标识符(ID/SKU/slug)
+   - **list**: 列表页 - 展示多个条目，有分页
+   - **other**: 功能页 - 登录、帮助、购物车等
+   - **unclear**: 不确定 - 如首页、混合页面
 
-| 问题         | 表现                           | 解决方案                                              |
-| ------------ | ------------------------------ | ----------------------------------------------------- |
-| 提取数量不符 | 提取了 20 个，首页分析说 48 个 | Prompt 要求 LLM 用 chrome-devtools 查看页面，找出遗漏 |
-| URL 不完整   | `url: "/vitamins/123.html"`    | Prompt 要求"以 http 打头的完整链接"                   |
-| Type 错误    | `type: "product_page"`         | Prompt 强调"只能是 detail/list/other/unclear 之一"    |
-| 重复 URL     | 同一商品出现多次               | 代码逻辑去重                                          |
+3. **测试验证**:
 
-**下一步**: `review_step2` 验证返回格式
+```bash
+python -m crawler.{category}.extractor_{site_name} extract_deals_from_mainpage
+```
+
+**输出产物**:
+
+- `extract_deals_from_mainpage` 方法实现
+- `site_tree.json` - 站点URL树结构
 
 ---
 
-#### 5.1.4 Step 2.1: URL 分类
+#### Step 2.1: URL 分类 (`step2_1__classify_urls`)
 
-**目标**: 用 LLM 对 site_tree.json 中的所有 URLs 进行精确分类，生成 site_patterns。
+**设计思路**:
 
-**Prompt 核心要求**:
+- 基于 `site_tree.json` 中的 URLs
+- 使用 Claude AI 识别 URL patterns
+- 自动归类并验证 patterns
 
-```jinja2
-# developer_nodes.py:650-800 (简化版)
-# 任务：URL 分类
+**核心流程**:
 
-## 输入文件
-`{{output_file_dir}}/site_tree.json`
+1. **Pattern 识别**:
+   - 最多识别 30 个 URL patterns
+   - 为每个 pattern 生成正则表达式
+   - 分类为 detail/list/other/unclear
 
-## 输出文件
-`{{output_file_dir}}/site_tree.json` (更新 `site_patterns` 字段)
+2. **验证机制**:
 
-## 分类规则
-对每个 URL 判断类型 (detail/list/other/unclear) 并归纳为 pattern:
-- **detail**: 详情页 - URL 包含商品唯一标识符 (ID、slug、SKU)
-- **list**: 列表页 - URL 展示多个条目 (分类页、搜索页、活动页)
-- **other**: 其他页面 - 登录、注册、帮助、购物车等
-- **unclear**: 不确定页面 - 无法轻易判断
-
-## 输出格式
-```json
-{
-  "site_tree": [ ... ],  // 原有内容保持不变
-  "site_patterns": [
-    {
-      "pattern": "r'https://www\\.gnc\\.com/[\\w-]+/\\d+\\.html'",
-      "type": "detail",
-      "description": "商品详情页 (路径 + ID + .html)",
-      "sample_url": "https://www.gnc.com/vitamins/123.html",
-      "count": 15
-    },
-    {
-      "pattern": "r'https://www\\.gnc\\.com/category/[\\w-]+'",
-      "type": "list",
-      "description": "分类列表页",
-      "sample_url": "https://www.gnc.com/category/vitamins",
-      "count": 3
-    }
-  ]
-}
+```bash
+# 每个 pattern 必须通过验证
+python -m devbot.tool check_pattern_match "<pattern>" "{output_file_dir}/site_tree.json"
 ```
 
-```
-**执行流程**:
+   - 返回 True: pattern 有效
+   - 返回 False: 重新识别
 
-```python
-# developer_nodes.py:676-816
-async def step2_1__classify_urls(state: CrawlerDevState) -> CrawlerDevState:
-    """Step 2.1: URL 分类，生成 site_patterns"""
+3. **两轮处理**:
+   - 第一轮: 处理全部或随机采样 200 个 URL
+   - 第二轮: 处理剩余未匹配的 URL(最多100个)
+   - 去重合并结果
 
-    # 1. 渲染 prompt
-    prompt = get_step_prompt('step2_1', state)
+**输出产物**:
 
-    # 2. 调用 crawler-developer agent
-    result = await call_subagent('crawler-developer', prompt, session_id=state.get("session_id"))
-
-    response_text = result.get("message", "")
-    new_session_id = result.get("session_id")
-
-    # 3. 保存对话历史
-    save_conversation_from_state(state=state, prompt=prompt, response=response_text,
-                                 node_name="step2_1__classify_urls",
-                                 metadata={"agent": "crawler-developer"})
-
-    # 4. Git 提交
-    auto_commit_if_enabled(state, "step2_1__classify_urls", "URL 分类，生成 site_patterns")
-
-    # 5. 返回更新后的 state
-    return {
-        **state,
-        "session_id": new_session_id,
-        "current_step": "2.1",
-        "current_step_name": "classify_urls",
-        "status": "completed",
-        "result": response_text
-    }
-```
-
-**输出示例** (site_tree.json 更新后):
-
-```json
-{
-  "site_tree": [ ... ],  // 保持不变
-  "site_patterns": [
-    {
-      "pattern": "r'https://www\\.gnc\\.com/[\\w-]+/\\d+\\.html'",
-      "type": "detail",
-      "description": "商品详情页 (路径 + ID + .html)",
-      "sample_url": "https://www.gnc.com/vitamins/123.html",
-      "count": 15
-    },
-    {
-      "pattern": "r'https://www\\.gnc\\.com/category/[\\w-]+'",
-      "type": "list",
-      "description": "分类列表页",
-      "sample_url": "https://www.gnc.com/category/vitamins",
-      "count": 3
-    },
-    {
-      "pattern": "r'https://www\\.gnc\\.com/[\\w-]+/?'",
-      "type": "unclear",
-      "description": "不确定类型页面 (通用路径)",
-      "sample_url": "https://www.gnc.com/about",
-      "count": 2
-    }
-  ]
-}
-```
-
-**潜在问题**:
-
-| 问题              | 表现                                     | 解决方案                              |
-| ----------------- | ---------------------------------------- | ------------------------------------- |
-| Pattern 过于宽泛  | `r'https://www\\.gnc\\.com/.*'` 匹配所有 | Prompt 要求"尽可能具体，避免过度泛化" |
-| Pattern 语法错误  | `r'https://www.gnc.com/\d+'` (未转义点)  | Review 步骤会检测并重新生成           |
-| 归类错误          | 把详情页归类为 list                      | Prompt 提供详细的分类规则             |
-| Sample URL 不匹配 | sample_url 与 pattern 不匹配             | Review 步骤验证正则表达式             |
-
-**下一步**: `review_step2_1` 验证 site_patterns 格式
+- `{tmp_folder}/{site_name}/temp_site_patterns.json` - 临时 patterns
+- `site_tree.json` 更新 - 添加 `site_patterns` 和 `matched_pattern` 字段
 
 ---
 
-#### 5.1.5 Step 3: 生成 URL Patterns
+#### Step 3: 生成 URL Patterns (`step3__generate_url_patterns`)
 
-**目标**: 将 site_patterns 转换为代码中的 `url_list_patterns`、`url_detail_patterns` 和 `URL_MAP`。
+**设计思路**:
 
-**Prompt 核心要求**:
+- 读取 step2.1 生成的 patterns
+- 按类型分类注册到代码
+- 设置 `url_list_patterns`、`url_detail_patterns`、`unclear_patterns`
 
-```jinja2
-# developer_nodes.py:835-918 (简化版)
-# 任务：生成 URL Patterns
-
-## 输入文件
-`{{output_file_dir}}/site_tree.json` (site_patterns 字段)
-
-## 输出代码
-`{{base_file_path}}`
-
-## 生成内容
-1. `url_list_patterns`: List[str] - 所有 type=list 的 patterns
-2. `url_detail_patterns`: List[str] - 所有 type=detail 的 patterns
-3. `URL_MAP`: Dict - 语义化 key + patterns 数组
-
-## URL_MAP 格式
+**核心逻辑**:
 
 ```python
-URL_MAP = {
-    'mainpage': {
-        'patterns': [r'https://www\.gnc\.com/?$'],
-        'sample_urls': ['https://www.gnc.com'],
-        'func': extract_deals_from_mainpage,
-        'action': 'get_list_info'
-    },
-    'detail_page': {
-        'patterns': [r'https://www\.gnc\.com/[\w-]+/\d+\.html'],
-        'sample_urls': ['https://www.gnc.com/vitamins/123.html'],
-        'func': None,  # Step 5 填充
-        'action': 'get_detail_info'
-    },
-    'category_list': {
-        'patterns': [r'https://www\.gnc\.com/category/[\w-]+'],
-        'sample_urls': ['https://www.gnc.com/category/vitamins'],
-        'func': None,  # Step 6 填充
-        'action': 'get_list_info'
-    }
+# 从 site_tree.json 读取 patterns
+patterns_data = {
+    "list_patterns": [p for p in patterns if p['type'] == 'list'],
+    "detail_patterns": [p for p in patterns if p['type'] == 'detail'],
+    "unclear_patterns": [p for p in patterns if p['type'] not in ('detail', 'list')]
 }
+
+# 在代码中设置这三个数组
+url_list_patterns = [...]
+url_detail_patterns = [...]
+unclear_patterns = [...]
 ```
 
-```
-**执行流程**:
+**示例代码**:
 
 ```python
-# developer_nodes.py:832-918
-async def step3__generate_url_patterns(state: CrawlerDevState) -> CrawlerDevState:
-    """Step 3: 生成 URL patterns"""
-
-    # 1. 渲染 prompt
-    prompt = get_step_prompt('step3', state)
-
-    # 2. 调用 crawler-developer agent
-    result = await call_subagent('crawler-developer', prompt, session_id=state.get("session_id"))
-
-    response_text = result.get("message", "")
-    new_session_id = result.get("session_id")
-
-    # 3. 保存对话历史
-    save_conversation_from_state(state=state, prompt=prompt, response=response_text,
-                                 node_name="step3__generate_url_patterns",
-                                 metadata={"agent": "crawler-developer"})
-
-    # 4. Git 提交
-    auto_commit_if_enabled(state, "step3__generate_url_patterns", "生成 URL patterns")
-
-    # 5. 返回更新后的 state
-    return {
-        **state,
-        "session_id": new_session_id,
-        "current_step": "3",
-        "current_step_name": "generate_url_patterns",
-        "status": "completed",
-        "result": response_text
-    }
-```
-
-**输出示例** (代码):
-
-```python
-# crawler/product/extractor_gnc.py
 url_list_patterns = [
-    r'https://www\.gnc\.com/?$',
-    r'https://www\.gnc\.com/category/[\w-]+'
+    r'^https?://(?:www\.)?newsite\.com/?$',  # 主页
+    r'^https?://(?:www\.)?newsite\.com/shop\?.*',  # 新品列表页
 ]
-
 url_detail_patterns = [
-    r'https://www\.gnc\.com/[\w-]+/\d+\.html'
+    r'^https?://(?:www\.)?newsite\.com/view-deal/\d+/?',  # 详情页
 ]
-
-URL_MAP = {
-    'mainpage': {
-        'patterns': [r'https://www\.gnc\.com/?$'],
-        'sample_urls': ['https://www.gnc.com'],
-        'func': extract_deals_from_mainpage,
-        'action': 'get_list_info'
-    },
-    'detail_page': {
-        'patterns': [r'https://www\.gnc\.com/[\w-]+/\d+\.html'],
-        'sample_urls': ['https://www.gnc.com/vitamins/123.html'],
-        'func': None,  # Step 5 填充
-        'action': 'get_detail_info'
-    },
-    'category_list': {
-        'patterns': [r'https://www\.gnc\.com/category/[\w-]+'],
-        'sample_urls': ['https://www.gnc.com/category/vitamins'],
-        'func': None,  # Step 6 填充
-        'action': 'get_list_info'
-    }
-}
 ```
-
-**潜在问题**:
-
-| 问题                        | 表现                          | 解决方案                           |
-| --------------------------- | ----------------------------- | ---------------------------------- |
-| URL_MAP 缺少 mainpage       | 未生成主页映射                | Prompt 强调"必须包含 mainpage key" |
-| Patterns 顺序错误           | 宽泛 pattern 在前，导致误匹配 | Prompt 要求"具体 pattern 优先"     |
-| Sample URL 不在 patterns 中 | sample_url 与 pattern 不匹配  | Review 步骤会检测并报错            |
-
-**下一步**: `review_step3` 验证 URL_MAP 格式
 
 ---
 
-### 5.2 阶段 2: 提取器循环 (Step 4-6)
+#### Step 3.1: 处理 unclear patterns (`step3_1__handle_unclear_pattern`)
 
-这是 DevBot 最复杂的部分，使用 **循环结构** 为每个 URL pattern 生成对应的提取器。
+**设计思路**:
 
-#### 5.2.1 循环控制流程
+- 针对 unclear 类型的 URL
+- 使用 chrome-devtools 实际访问页面
+- 人工/AI 判断是列表页还是详情页
 
-```
-Step 4: 初始化 patterns_queue
-    ↓
-Step 4.1: patterns_queue.pop(0) → current_pattern_info
-    ↓
-├─ type == "detail" → Step 5: 生成详情页提取器
-│       ├─ Step 5.1: fetch_rendered_html
-│       ├─ Step 5.2: remove_site_chrome
-│       ├─ Step 5.3: extract_main_content
-│       ├─ Step 5.4: convert_html_to_markdown
-│       ├─ Step 5.5: collect_other_info
-│       └─ Step 5.6: intercept_ajax_comment
-│
-└─ type == "list" → Step 6: 生成列表页提取器
-    ↓
-completed_patterns.append(current_pattern)
-    ↓
-判断: patterns_queue 非空？
-    ├─ 是 → 返回 Step 4.1 (继续循环)
-    └─ 否 → 进入 Step 7 (网站树扩展)
-```
+**判断标准**:
 
-#### 5.2.2 Step 4: 初始化 Patterns 队列
+**列表页特征**:
 
-**目标**: 从 `url_detail_patterns` 和 `url_list_patterns` 构建待处理队列。
+- 展示多个条目
+- 有分页/加载更多
+- 包含多个链接指向详情页
 
-**执行流程**:
+**详情页特征**:
 
-```python
-# developer_nodes.py:1094-1148
-async def step4__init_patterns_queue(state: CrawlerDevState) -> CrawlerDevState:
-    """Step 4: 初始化 patterns 队列"""
+- 展示单个条目完整信息
+- URL 含唯一标识符
+- 有价格、购买按钮等
 
-    # 1. 动态导入模块
-    module_path = f'crawler.{state["category"]}.extractor_{state["site_name"]}'
-    if module_path in sys.modules:
-        del sys.modules[module_path]
+**操作步骤**:
 
-    extractor_module = importlib.import_module(module_path)
+1. `mcp__chrome-devtools__new_page` 打开 URL
+2. `mcp__chrome-devtools__take_snapshot` 获取快照
+3. 分析页面结构
+4. 更新 pattern 类型
 
-    # 2. 获取 patterns
-    url_list_patterns = getattr(extractor_module, 'url_list_patterns', [])
-    url_detail_patterns = getattr(extractor_module, 'url_detail_patterns', [])
-    URL_MAP = getattr(extractor_module, 'URL_MAP', {})
+---
 
-    # 3. 构建队列 (detail patterns 优先)
-    patterns_queue = []
+#### Step 4: 初始化 Patterns 队列 (`step4__init_patterns_queue`)
 
-    # 添加 detail patterns
-    for pattern in url_detail_patterns:
-        # 从 URL_MAP 中找到对应的 sample_url
-        for key, config in URL_MAP.items():
-            if pattern in config.get('patterns', []):
-                sample_url = config.get('sample_urls', [None])[0]
-                patterns_queue.append({
-                    'pattern': pattern,
-                    'type': 'detail',
-                    'sample_url': sample_url,
-                    'key': key
-                })
-                break
+**设计思路**:
 
-    # 添加 list patterns (排除 mainpage)
-    for pattern in url_list_patterns:
-        for key, config in URL_MAP.items():
-            if key == 'mainpage':  # 跳过主页
-                continue
-            if pattern in config.get('patterns', []):
-                sample_url = config.get('sample_urls', [None])[0]
-                patterns_queue.append({
-                    'pattern': pattern,
-                    'type': 'list',
-                    'sample_url': sample_url,
-                    'key': key
-                })
-                break
+- 准备处理所有 URL patterns
+- 创建 patterns 队列
+- 跟踪已完成的 patterns
 
-    logger.info(f"✅ Patterns 队列已初始化，共 {len(patterns_queue)} 个 patterns")
-
-    # 4. 返回更新后的 state
-    return {
-        **state,
-        "current_step": "4",
-        "current_step_name": "init_patterns_queue",
-        "status": "completed",
-        "patterns_queue": patterns_queue,
-        "completed_patterns": [],
-        "result": f"初始化了 {len(patterns_queue)} 个 patterns"
-    }
-```
-
-**patterns_queue 示例**:
+**核心逻辑**:
 
 ```python
-[
+# 从代码模块读取 patterns
+url_list_patterns = getattr(module, 'url_list_patterns', [])
+url_detail_patterns = getattr(module, 'url_detail_patterns', [])
+
+# 构建队列
+patterns_queue = [
     {
-        'pattern': r'https://www\.gnc\.com/[\w-]+/\d+\.html',
-        'type': 'detail',
-        'sample_url': 'https://www.gnc.com/vitamins/123.html',
-        'key': 'detail_page'
-    },
-    {
-        'pattern': r'https://www\.gnc\.com/category/[\w-]+',
+        'pattern': pattern,
         'type': 'list',
-        'sample_url': 'https://www.gnc.com/category/vitamins',
-        'key': 'category_list'
+        'sample_url': get_sample_url(pattern)
     }
+    for pattern in url_list_patterns
+] + [
+    {
+        'pattern': pattern,
+        'type': 'detail',
+        'sample_url': get_sample_url(pattern)
+    }
+    for pattern in url_detail_patterns
 ]
-```
 
-**下一步**: `step4_1__next_pattern` (取出第一个 pattern)
+# 过滤已完成的 patterns
+completed_patterns = state.get("completed_patterns", [])
+patterns_queue = [p for p in patterns_queue if p['pattern'] not in completed_patterns]
+```
 
 ---
 
-#### 5.2.3 Step 4.1: 取出下一个 Pattern
+#### Step 4.1: 获取下一个 Pattern (`step4_1__next_pattern`)
 
-**目标**: 从队列中弹出一个 pattern，设置为当前处理对象。
+**设计思路**:
 
-**执行流程**:
+- 从队列中取出下一个 pattern
+- 设置当前处理的 pattern 信息
+- 路由到对应的处理节点
 
-```python
-# developer_nodes.py:1148-1330
-async def step4_1__next_pattern(state: CrawlerDevState) -> CrawlerDevState:
-    """Step 4.1: 取出队列中的下一个 pattern"""
-
-    # 1. 检查队列是否为空
-    patterns_queue = state.get("patterns_queue", [])
-    if not patterns_queue:
-        logger.info("⏭️ Patterns 队列已空，跳过 Step 5-6")
-        return {
-            **state,
-            "current_step": "4.1",
-            "current_step_name": "next_pattern",
-            "status": "skipped",
-            "result": "No more patterns"
-        }
-
-    # 2. 弹出第一个 pattern
-    current_pattern_info = patterns_queue.pop(0)
-    current_url_pattern = current_pattern_info['pattern']
-    current_sample_url = current_pattern_info['sample_url']
-
-    # 3. 计算 MD5 (用于文件命名)
-    current_sample_url_md5 = hashlib.md5(current_sample_url.encode()).hexdigest()
-
-    # 4. 生成文件 ID
-    last_file_id = f"{current_pattern_info['key']}_{current_sample_url_md5[:8]}"
-
-    logger.info(f"📌 当前处理 pattern: {current_url_pattern[:70]}...")
-    logger.info(f"📍 Sample URL: {current_sample_url}")
-    logger.info(f"🏷️ File ID: {last_file_id}")
-
-    # 5. 返回更新后的 state
-    return {
-        **state,
-        "current_step": "4.1",
-        "current_step_name": "next_pattern",
-        "status": "completed",
-        "patterns_queue": patterns_queue,  # 更新后的队列
-        "current_pattern_info": current_pattern_info,
-        "current_url_pattern": current_url_pattern,
-        "current_sample_url": current_sample_url,
-        "current_sample_url_md5": current_sample_url_md5,
-        "last_file_id": last_file_id,
-        "result": f"Processing: {current_pattern_info['key']}"
-    }
-```
-
-**路由决策** (routing_logic.py):
+**路由逻辑**:
 
 ```python
-def route_after_step4_1(state: CrawlerDevState) -> str:
-    """根据 pattern 类型决定下一步"""
-    if state["status"] == "skipped":
-        return "step7__site_tree_expand"  # 队列为空，跳到 Step 7
-
-    pattern_type = state["current_pattern_info"]["type"]
-
-    if pattern_type == "detail":
-        return "step5__generate_extractor_class"  # 详情页 → Step 5
-    elif pattern_type == "list":
-        return "step6__generate_list_extractor"  # 列表页 → Step 6
-    else:
-        # unclear/other 类型，跳过
-        completed_patterns = state.get("completed_patterns", [])
-        completed_patterns.append(state["current_url_pattern"])
-        return "step4_1__next_pattern"  # 继续下一个
+if not patterns_queue:
+    return "reviewer_step4"  # 队列为空，进入审查
+elif current_pattern['type'] == 'detail':
+    return "step5__generate_extractor_class"  # 详情页处理
+elif current_pattern['type'] == 'list':
+    return "step6__generate_list_extractor"  # 列表页处理
 ```
-
-**下一步**:
-
-- type == "detail" → `step5__generate_extractor_class`
-- type == "list" → `step6__generate_list_extractor`
 
 ---
 
-#### 5.2.4 Step 5: 生成详情页提取器类
+#### Step 5: 生成详情页提取器类 (`step5__generate_extractor_class`)
 
-**目标**: 创建详情页提取器类的框架，包括类定义、初始化方法。
+**设计思路**:
 
-**Prompt 核心要求** (简化版):
+- 为每个详情页 pattern 创建提取器类
+- 实现 `do()` 方法框架
+- 添加详情页分析注释
 
-```jinja2
-# 任务：生成详情页提取器类
+**关键任务**:
 
-## Sample URL
-{{current_sample_url}}
+1. **页面分析**:
+   - 打开样例 URL
+   - 截取长图
+   - 分析页面结构(头栏、评论区、商品参数位置)
 
-## 任务步骤
-1. 用 chrome-devtools 打开 sample URL
-2. 分析页面结构：
-   - 头栏/底栏位置
-   - 评论区位置
-   - 商品参数位置
-   - FAQ/Q&A 位置
-3. 将分析结果写入代码注释 `"""详情页分析: ..."""`
-4. 创建提取器类：
+2. **类命名规则**:
 
 ```python
-class {{cls_name}}(BaseExtractor, ProductDetailMixin):
-    """{{site_name}} 详情页提取器"""
+# 示例: gnc 站点的 product 类别
+class GncProductExtractor(BaseExtractor, ProductDetailMixin):
+    pass
+```
 
-    async def fetch_rendered_html(self, page) -> tuple:
-        """获取渲染后的纯HTML"""
-        pass  # Step 5.1 填充
+3. **方法框架**:
 
-    def remove_site_chrome(self, html: str) -> str:
-        """移除头栏/底栏"""
-        pass  # Step 5.2 填充
-
-    def extract_main_content(self, html: str) -> str:
-        """提取主商品内容"""
-        pass  # Step 5.3 填充
-
-    def convert_html_to_markdown(self, html: str) -> str:
-        """转换为 Markdown"""
-        pass  # Step 5.4 填充
-
+```python
 async def extract_product_detail(page: PageParam) -> dict:
-    """详情页提取入口"""
-    return await {{cls_name}}(page).do()
+    """提取商品详情"""
+    return await GncProductExtractor(page).do()
 ```
 
-5. 更新 URL_MAP，将 func 设置为 `extract_product_detail`
-
-```
-**执行流程**:
+4. **URL_MAP 注册**:
 
 ```python
-# developer_nodes.py:1330-1376
-async def step5__generate_extractor_class(state) -> CrawlerDevState:
-    """Step 5: 生成详情页提取器类"""
-
-    # 1. 渲染 prompt
-    prompt = get_step_prompt('step5', state)
-
-    # 2. 调用 crawler-developer agent
-    result = await call_subagent('crawler-developer', prompt, session_id=state.get("session_id"))
-
-    response_text = result.get("message", "")
-    new_session_id = result.get("session_id")
-
-    # 3. 检测是否需要跳过后续步骤
-    if '该页面不是目标详情页，中止后续步骤!!!' in response_text:
-        logger.info("⏭️ 检测到该页面不是目标详情页，跳过 step5 后续步骤")
-        completed_patterns = state.get("completed_patterns", [])
-        current_pattern = state.get("current_url_pattern")
-        if current_pattern and current_pattern not in completed_patterns:
-            completed_patterns = completed_patterns + [current_pattern]
-        return {
-            **state,
-            "session_id": new_session_id,
-            "current_step": "5",
-            "current_step_name": "generate_extractor_class",
-            "status": "skipped",
-            "completed_patterns": completed_patterns,
-            "next_action": "skip_to_next_pattern"
-        }
-
-    # 4. 保存对话历史
-    save_conversation_from_state(state=state, prompt=prompt, response=response_text,
-                                 node_name="step5__generate_extractor_class",
-                                 metadata={"agent": "crawler-developer"})
-
-    # 5. 标记当前 pattern 为已完成
-    completed_patterns = state.get("completed_patterns", [])
-    current_pattern = state.get("current_url_pattern")
-
-    if current_pattern and current_pattern not in completed_patterns:
-        completed_patterns = completed_patterns + [current_pattern]
-        logger.info(f"✅ Pattern 已完成: {current_pattern[:70]}...")
-
-    # 6. Git 提交
-    auto_commit_if_enabled(state, "step5__generate_extractor_class", "生成详情页提取器类")
-
-    # 7. 返回更新后的 state
-    return {
-        **state,
-        "session_id": new_session_id,
-        "current_step": "5",
-        "current_step_name": "generate_extractor_class",
-        "status": "completed",
-        "completed_patterns": completed_patterns,
-        "result": response_text
-    }
-```
-
-**输出示例** (代码):
-
-```python
-# crawler/product/extractor_gnc.py
-
-"""详情页分析:
-- 头栏: class="site-header"
-- 底栏: class="site-footer"
-- 评论区: id="reviews-section", 通过 AJAX 加载
-- 商品参数: class="product-specs", 折叠区需点击展开
-- FAQ: class="faq-section"
-"""
-
-class GncDetailExtractor(BaseExtractor, ProductDetailMixin):
-    """Gnc 详情页提取器"""
-
-    async def fetch_rendered_html(self, page) -> tuple:
-        """获取渲染后的纯HTML"""
-        pass  # Step 5.1 填充
-
-    def remove_site_chrome(self, html: str) -> str:
-        """移除头栏/底栏"""
-        pass  # Step 5.2 填充
-
-    def extract_main_content(self, html: str) -> str:
-        """提取主商品内容"""
-        pass  # Step 5.3 填充
-
-    def convert_html_to_markdown(self, html: str) -> str:
-        """转换为 Markdown"""
-        pass  # Step 5.4 填充
-
-async def extract_product_detail(page: PageParam) -> dict:
-    """详情页提取入口"""
-    return await GncDetailExtractor(page).do()
-
-# 更新 URL_MAP
 URL_MAP = {
-    ...,
-    'detail_page': {
-        'patterns': [r'https://www\.gnc\.com/[\w-]+/\d+\.html'],
-        'sample_urls': ['https://www.gnc.com/vitamins/123.html'],
-        'func': extract_product_detail,  # ✅ 已更新
+    'product_detail': {
+        'patterns': [r'https://www\.gnc\.com/.+/\d+\.html'],
+        'func': extract_product_detail,
         'action': 'get_detail_info'
     }
 }
@@ -2123,258 +1481,1162 @@ URL_MAP = {
 
 **跳过机制**:
 
-如果 LLM 判断 sample_url 不是目标详情页（例如误判），会在响应中包含特殊标记：
-
-```
-该页面不是目标详情页，中止后续步骤!!!
-```
-
-代码检测到这个标记后，会：
-
-1. 跳过 Step 5.1-5.6
-2. 将 pattern 标记为已完成
-3. 直接返回 Step 4.1 (处理下一个 pattern)
-
-**下一步**: `step5_1__generate_fetch_rendered_html`
+- 如果检测到"该页面不是目标详情页"，跳过后续步骤
+- 标记 pattern 为已完成，继续下一个
 
 ---
 
-(由于篇幅限制，继续在下一部分...)
+#### Step 5.1: 实现 fetch_rendered_html (`step5_1__generate_fetch_rendered_html`)
 
-#### 5.2.5 Step 5.1-5.6: 详情页方法生成
+**设计思路**:
 
-这6个子步骤分别生成详情页提取器的各个方法，形成完整的数据提取流水线。
+- 获取渲染后的纯 HTML(无 JS)
+- 触发页面动态内容加载
+- 保存原始和渲染后的 HTML
 
-**Step 5.1: fetch_rendered_html** - 获取渲染后的纯HTML
-
-- 滚动到评论区触发AJAX加载
-- 滚动到底部确保所有内容加载
-- 保存原始HTML和渲染后HTML（无JS）
-
-**Step 5.2: remove_site_chrome** - 移除站点通用元素
-
-- 移除头栏、底栏、导航栏
-- 移除公告、广告、侧边栏
-
-**Step 5.3: extract_main_content** - 提取主商品内容
-
-- 移除推荐商品、广告
-- 保留商品标题、价格、描述、参数、评论、FAQ
-
-**Step 5.4: convert_html_to_markdown** - 转换为Markdown
-
-- 使用html2text或自定义转换器
-- 保留结构化信息（表格、列表）
-
-**Step 5.5: collect_other_info** - 收集其他信息
-
-- 商品ID、SKU
-- 商品分类、品牌
-- 评分、评论数
-
-**Step 5.6: intercept_ajax_comment** - 拦截AJAX评论请求
-
-- 分析评论API请求
-- 编写直接调用API的代码（可选）
-
-**潜在问题汇总**:
-
-| 步骤 | 常见问题         | 解决方案                                   |
-| ---- | ---------------- | ------------------------------------------ |
-| 5.1  | 评论未加载       | 增加等待时间，检查评论元素                 |
-| 5.2  | 误删主内容       | 使用更精确的CSS选择器                      |
-| 5.3  | 推荐商品未清理   | 分析页面结构，找出推荐区域特征             |
-| 5.4  | Markdown格式混乱 | 调整html2text参数                          |
-| 5.5  | 字段提取失败     | 使用正则表达式或CSS选择器                  |
-| 5.6  | API请求找不到    | 使用chrome-devtools的list_network_requests |
-
----
-
-#### 5.2.6 Step 6: 生成列表页提取器
-
-**目标**: 为列表页（分类页、搜索页等）生成提取器。
-
-**与Step 2的区别**:
-
-- Step 2: 主页提取器（已实现）
-- Step 6: 其他列表页提取器（使用相同逻辑）
-
-**实现**:
+**实现步骤**:
 
 ```python
-async def extract_from_category_page(page: PageParam) -> dict:
-    """分类页提取器"""
-    # 复用 extract_deals_from_mainpage 的逻辑
-    return await extract_deals_from_mainpage(page)
+async def fetch_rendered_html(self, page) -> tuple:
+    """在已加载的页面上滚动触发渲染，保存HTML文件
 
-# 更新 URL_MAP
-URL_MAP['category_list']['func'] = extract_from_category_page
+    Args:
+        page: playwright页面对象(已由do方法加载好内容)
+
+    Returns:
+        tuple: (page, 渲染后HTML(无JS), site_info字典)
+    """
+    # 1. 滚动到评论区触发加载(如有)
+    await page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.6)")
+    await page.wait_for_timeout(3000)  # 等待评论加载
+
+    # 2. 滚动到底部确保所有内容加载
+    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    await page.wait_for_timeout(2000)
+
+    # 3. 获取完整HTML并保存
+    html = await page.content()
+    self.save_origin_html_file(html)  # step0_origin_xxx.html
+    rendered_html = self.save_rendered_html(html)  # step1_rendered_xxx.html (移除JS)
+
+    # 4. 返回三元组
+    site_info = {'title': await page.title()}
+    return (page, rendered_html, site_info)
 ```
+
+**验证检查**:
+
+- step0_origin_xxx.html - 原始HTML(含JS)
+- step1_rendered_xxx.html - 渲染后HTML(已移除JS)
+- 确认评论、参数等JS加载内容已显示
 
 ---
 
-### 5.3 阶段 3: 网站树扩展 (Step 7-10)
+#### Step 5.2: 实现 remove_site_chrome (`step5_2__generate_remove_site_chrome`)
 
-#### 5.3.1 Step 7: 网站树扩展一层
+**设计思路**:
 
-**目标**: 访问列表页中的子页面，扩展网站树到下一层。
+- 移除网站装饰元素(头栏、底栏、导航等)
+- 保留商品核心内容
+- "site chrome"是网页行业术语，指全站框架元素
 
-**工作流程**:
+**清理目标**:
+
+1. **头部导航** - header, nav
+2. **底部区域** - footer
+3. **侧边栏** - sidebar
+4. **浮动元素** - 固定定位的广告、客服窗口
+
+**方法签名**:
 
 ```python
-1. 读取 site_tree.json 中的 level=1 的列表页
-2. 对每个列表页调用其提取器
-3. 获取子页面URLs（level=2）
-4. 追加到 site_tree.json
-5. 检测是否有新的 URL patterns
-6. 如果有新patterns，标记 has_new_patterns_in_step7=True
+def remove_site_chrome(self, html: str) -> str:
+    """移除网站通用头栏/底栏/公告等 chrome UI
+
+    Args:
+        html: 渲染后的HTML(来自step1)
+
+    Returns:
+        str: 移除装饰后的HTML
+    """
+    soup = BeautifulSoup(html, 'html.parser')
+
+    # 移除头部
+    for header in soup.find_all(['header', 'nav']):
+        header.decompose()
+
+    # 移除底部
+    for footer in soup.find_all('footer'):
+        footer.decompose()
+
+    return str(soup)
+```
+
+**验证步骤**:
+
+- 对比 step1 和 step2 文件字符数
+- 用 chrome-devtools 打开 step2 文件
+- 确认无 header/nav/footer 标签
+- 商品内容完整保留
+
+---
+
+#### Step 5.3: 实现 extract_main_content (`step5_3__generate_extract_main_content`)
+
+**设计思路**:
+
+- 移除非商品相关的干扰元素
+- 保留商品主体内容
+- 区别于 step5.2: 这里移除的是页面内容层面的干扰
+
+**清理目标**:
+
+1. **推荐商品** - "你可能喜欢"、"相关商品"
+2. **广告模块** - 各类广告位
+3. **侧边栏** - 非主要内容
+4. **弹窗提示** - Cookie提示、订阅弹窗
+5. **导航面包屑** - 可选保留
+
+**保留内容**:
+
+- ✅ 商品标题、价格
+- ✅ 商品图片
+- ✅ 规格参数
+- ✅ 详细描述
+- ✅ 用户评论
+- ✅ Q&A问答
+
+**方法签名**:
+
+```python
+def extract_main_content(self, html: str) -> str:
+    """移除推荐商品、广告、侧栏等非主商品内容
+
+    Args:
+        html: 移除站点装饰后的HTML(来自step2)
+
+    Returns:
+        str: 提取主要内容后的HTML
+    """
+    soup = BeautifulSoup(html, 'html.parser')
+
+    # 移除推荐商品
+    for rec in soup.find_all(class_=re.compile(r'recommend|related|similar')):
+        rec.decompose()
+
+    # 移除广告
+    for ad in soup.find_all(class_=re.compile(r'ad|banner|promo')):
+        ad.decompose()
+
+    return str(soup)
+```
+
+**验证要求**:
+
+- 截长图对比 step2 和 step3
+- 字数应减少(只保留主要内容)
+- 商品核心信息完整
+
+---
+
+#### Step 5.4: 实现 convert_html_to_markdown (`step5_4__generate_convert_markdown`)
+
+**设计思路**:
+
+- 将清理后的 HTML 转换为 Markdown
+- 保持内容结构和层级
+- 便于后续 LLM 提取
+
+**转换要求**:
+
+**需要提取的内容**:
+
+1. **文本内容** - 所有可见文本，保持层级
+2. **图片** - 转为 Markdown 图片语法 `![alt](url)`
+3. **链接** - 转为 `[text](url)`
+4. **表格** - 转为 Markdown 表格
+5. **列表** - 转为 Markdown 列表
+
+**方法签名**:
+
+```python
+def convert_html_to_markdown(self, html: str) -> str:
+    """将 HTML 转换为 Markdown
+
+    Args:
+        html: 清理后的HTML(来自step3)
+
+    Returns:
+        str: Markdown 格式文本
+    """
+    # 使用 html2text 或自定义转换逻辑
+    import html2text
+    h = html2text.HTML2Text()
+    h.ignore_links = False
+    h.ignore_images = False
+    return h.handle(html)
+```
+
+**输出产物**:
+
+- step4_markdown_xxx.md - 最终的 Markdown 文件
+
+---
+
+#### Step 5.5: 收集其它信息 (`step5_5__collect_other_info`)
+
+**设计思路**:
+
+- 从页面提取额外的元数据
+- 补充 `do()` 方法的返回字典
+- 为后续 LLM 提取提供上下文
+
+**可能收集的信息**:
+
+- 页面 meta 标签
+- 结构化数据(JSON-LD)
+- Open Graph 标签
+- 价格、库存等关键信息
+
+---
+
+#### Step 6: 生成列表页提取器 (`step6__generate_list_extractor`)
+
+**设计思路**:
+
+- 为每个列表页 pattern 实现提取方法
+- 从列表页提取子页面 URL
+- 支持分页处理
+
+**关键任务**:
+
+1. **方法命名**: `extract_list_from_{pattern_name}`
+2. **返回格式**:
+
+```python
+{
+    'site_name': str,
+    'title': str,
+    'urls': [
+        {'url': str, 'title': str, 'type': 'detail'|'list'}
+    ]
+}
+```
+
+3. **URL_MAP 注册**:
+
+```python
+URL_MAP = {
+    'category_list': {
+        'patterns': [r'https://www\.site\.com/category/.*'],
+        'func': extract_list_from_category,
+        'action': 'get_list_info'
+    }
+}
+```
+
+**异常处理**:
+
+- 捕获 SubagentError 并记录
+- 发送 Slack 告警
+- 标记 pattern 为已完成(跳过)，继续下一个
+
+---
+
+#### Step 7: 扩展 Site Tree 深度 (`step7__site_tree_expand_level`)
+
+**设计思路**:
+
+- 从已有的列表页继续抓取下一层 URL
+- 发现新的 URL patterns
+- 循环处理直到无新 patterns
+
+**核心流程**:
+
+```python
+# 1. 动态导入 Extractor 类
+extractor_class = getattr(module, f'Base{site_name.capitalize()}Extractor')
+
+# 2. 扩展一层
+expansion_result = await extractor_class.expand_one_level_from_list_pages(urls)
+
+# 3. 更新 site_tree.json
+content['site_tree'] = urls + expansion_result['new_urls']
+
+# 4. AI 分析新 URLs，生成新 patterns
+patterns = UrlHandler.classify_urls(category, site_name)
+
+# 5. 判断是否有新 patterns
+has_new_patterns = len(patterns) > len(site_patterns)
 ```
 
 **循环控制**:
 
-```python
-# routing_logic.py
-def route_after_step7(state: CrawlerDevState) -> str:
-    if state["has_new_patterns_in_step7"]:
-        if state["step7_loop_count"] < 3:
-            return "step3__generate_url_patterns"  # 重新生成patterns
-        else:
-            logger.warning("Step 7 循环次数达到上限")
-            return "step8__analyze_markdown_info"
-    else:
-        return "step8__analyze_markdown_info"
-```
+- 如果有新 patterns: 回到 Step 3
+- 如果无新 patterns: 进入 Step 8
+- `step7_loop_count`: 记录循环次数
 
-**潜在问题**:
+**输出信息**:
 
-- **无限循环**: 如果每次都发现新patterns
-  - **解决**: step7_loop_count 最大值为3
-- **子页面过多**: 扩展后URLs数量爆炸
-  - **解决**: 限制每个列表页最多提取50个URLs
+- 层级变化: 1 → 2
+- 新增 URL 数量
+- 处理的 patterns 列表
 
 ---
 
-#### 5.3.2 Step 8: Markdown信息分析（占位）
+#### Step 8: 分析 Markdown 信息 (`step8__analyze_markdown_info`)
 
-**当前状态**: 占位步骤，仅更新状态。
+**设计思路**:
 
-**未来规划**: 用LLM分析提取的Markdown，优化提取逻辑。
+- 分析生成的 Markdown 内容
+- 为 LLM 提取准备提示词
+- (当前版本为占位实现)
+
+**未来扩展**:
+
+- 识别 Markdown 中的结构化信息
+- 生成针对性的提取 prompts
+- 优化 LLM 提取效果
 
 ---
 
-#### 5.3.3 Step 9: 首次运行测试
+#### Step 9: 第一次完整运行 (`step9__first_run`)
 
-**目标**: 执行一次完整的爬虫运行，验证功能。
+**设计思路**:
+
+- 提供完整运行命令
+- 验证整个爬虫系统
+- 由于耗时长，不自动执行
 
 **执行命令**:
 
 ```bash
-python -m crawler.base.extractor_scheduler <site_name> <entry_url> --max-level 2
+python -m crawler.{category}.extractor_{site_name} main
 ```
 
 **验证内容**:
 
-- 是否成功提取商品
-- 是否保存到数据库
-- 是否有错误日志
+- 列表页提取是否正常
+- 详情页提取是否正常
+- 数据保存是否正确
+- 性能是否可接受
 
 ---
 
-#### 5.3.4 Step 10: 生成 Airflow DAG
+#### Step 10: 添加 Airflow DAG (`step10__add_airflow_dag`)
 
-**目标**: 生成定时任务配置，用于生产环境调度。
+**设计思路**:
 
-**生成的DAG文件**:
+- 生成 Airflow 调度配置
+- 随机分配运行时间(避免同时运行)
+- 创建 DAG 文件
+
+**配置生成**:
 
 ```python
-# crawler/airflow_dags/deal_<site>_dag.py
+# 随机调度时间
+hour = random.randint(0, 23)
+minute = random.randint(0, 59)
+schedule = f"{minute} {hour} * * *"  # Cron 格式
+
+# 生成配置
+config = generate_dag_config(
+    site_name=site_name,
+    site_url=site_url,
+    category=category,
+    schedule=schedule,
+    retries=2,
+    retry_delay_minutes=7
+)
+
+# 生成 DAG 文件
+output_path = generate_dag_file(config)
+# 输出: dags/{category}_{site_name}_dag.py
+```
+
+**DAG 示例**:
+
+```python
+# dags/product_gnc_dag.py
 from airflow import DAG
-from airflow.operators.python import PythonOperator
 from datetime import datetime, timedelta
 
 default_args = {
-    'owner': 'airflow',
-    'depends_on_past': False,
-    'start_date': datetime(2025, 1, 1),
-    'retries': 1,
-    'retry_delay': timedelta(minutes=5),
+    'owner': 'crawler',
+    'retries': 2,
+    'retry_delay': timedelta(minutes=7)
 }
 
 dag = DAG(
-    'deal_<site>_crawler',
+    'product_gnc',
     default_args=default_args,
-    schedule_interval='0 */6 * * *',  # 每6小时运行一次
+    schedule_interval='30 14 * * *',  # 每天 14:30
+    start_date=datetime(2024, 1, 1),
     catchup=False
-)
-
-def run_crawler():
-    from crawler.base.extractor_scheduler import SiteScheduler
-    scheduler = SiteScheduler(
-        site_name='<site>',
-        entry_url='<url>',
-        site_info={'site': '<site>', 'url': '<url>', 'category': 'deal'},
-        max_level=3
-    )
-    await scheduler.analyze('<url>')
-
-task = PythonOperator(
-    task_id='run_<site>_crawler',
-    python_callable=run_crawler,
-    dag=dag
 )
 ```
 
 ---
 
-### 5.4 阶段 4: 代码优化 (Step 20-22)
+### 5.4 代码质量检测流程 (Step 20-22)
 
-#### 5.4.1 Step 20: 代码检查
+#### Step 20: 检查代码完成度 (`step20__check_code`)
 
-**目标**: 全面检查代码质量。
+**设计思路**:
+
+- 检测代码各部分是否完整
+- 决定下一步骤或进入性能检测
+- 提供补全路径
+
+**检查项目**:
+
+```python
+def _check_extractor_code(state):
+    # 1. 文件是否存在
+    if not file_path.exists():
+        return {'next_step': 'step0', 'reason': '文件不存在'}
+
+    # 2. 首页分析注释是否完成(至少50字)
+    if not page_analysis_match or len(match.group(1)) < 50:
+        return {'next_step': 'step1', 'reason': '首页分析注释未完成'}
+
+    # 3. extract_deals_from_mainpage 方法是否完整(至少15行)
+    if len(method_lines) < 15:
+        return {'next_step': 'step2', 'reason': '方法不足15行'}
+
+    # 4. site_tree.json 是否存在
+    if not site_tree_file.exists():
+        return {'next_step': 'step2_1', 'reason': 'site_tree.json不存在'}
+
+    # 5. url_list_patterns 是否有值
+    if not url_list_patterns:
+        return {'next_step': 'step3', 'reason': 'url_list_patterns无值'}
+
+    # 6. url_detail_patterns 是否有值
+    if not url_detail_patterns:
+        return {'next_step': 'step7', 'reason': 'url_detail_patterns无值'}
+
+    # 7. URL_MAP 是否处理了足够的 patterns(至少30%)
+    if handled_in_map < len(url_list_patterns) * 0.3:
+        return {'next_step': 'step4', 'reason': 'URL_MAP处理不足'}
+
+    # 8. URL_MAP 是否有 get_detail_info
+    if not has_detail_info:
+        return {'next_step': 'step4', 'reason': '缺少get_detail_info'}
+
+    # 9. DAG 文件是否存在
+    if not dag_file.exists():
+        return {'next_step': 'step10', 'reason': 'DAG文件不存在'}
+
+    # 通过所有检查
+    return {'next_step': 'step20_3', 'reason': '代码检查通过'}
+```
+
+**路由逻辑**:
+
+- 代码不完整: 返回对应的补全步骤
+- 代码完整: 进入 step20_3 方法签名检查
+
+---
+
+#### Step 20.1: 性能检测 (`step20_1__check_performance`)
+
+**设计思路**:
+
+- 测试 URL_MAP 中所有方法的执行性能
+- 识别耗时超过阈值的方法
+- 生成性能报告
+
+**检测流程**:
+
+```python
+# 1. 读取 URL_MAP
+for map_key, map_config in url_map.items():
+    func = map_config['func']
+    patterns = map_config['patterns']
+
+    # 2. 从 site_tree 或 patterns 找测试 URL
+    test_url = find_test_url(patterns, site_tree)
+
+    # 3. 执行方法并计时
+    start_time = time.time()
+    result = await func(test_url)
+    duration = time.time() - start_time
+
+    # 4. 记录结果
+    performance_results['methods'].append({
+        'method': func.__name__,
+        'test_url': test_url,
+        'duration_seconds': duration,
+        'status': 'success',
+        'result_count': len(result.get('urls', []))
+    })
+
+    # 5. 标记慢方法(超过30秒)
+    if duration > 30:
+        slow_methods.append(func.__name__)
+```
+
+**输出格式**:
+
+```json
+{
+  "site_name": "hsn",
+  "category": "product",
+  "methods": [
+    {
+      "method": "extract_deals_from_mainpage",
+      "action": "get_list_info",
+      "test_url": "https://www.hsn.com",
+      "duration_seconds": 14.43,
+      "status": "success",
+      "result_count": 501
+    }
+  ],
+  "summary": {
+    "total_methods": 5,
+    "slow_methods": ["extract_category_page"]
+  }
+}
+```
+
+**保存路径**:
+
+- `crawler/{category}/output/{site_name}/performance.json`
+
+---
+
+#### Step 20.2: 优化函数 (`step20_2__optimize_funcs`)
+
+**设计思路**:
+
+- 针对性能报告中的慢方法
+- 调用 AI 生成优化建议
+- 重写耗时函数
+
+**优化方向**:
+
+1. **并发处理** - 使用 asyncio.gather
+2. **缓存机制** - 避免重复请求
+3. **减少等待** - 优化 wait_for_timeout
+4. **选择器优化** - 更精确的 CSS/XPath
+5. **分页策略** - 限制爬取深度
+
+**Prompt 示例**:
+
+```markdown
+以下方法执行耗时 {duration} 秒，超过阈值 30 秒:
+
+方法名: {func_name}
+测试URL: {test_url}
+
+请分析代码并提供优化建议，重点考虑:
+1. 是否可以使用并发处理
+2. 是否有不必要的等待
+3. 选择器是否可以优化
+```
+
+---
+
+#### Step 20.3: 检查方法签名 (`step20_3__check_method_sign`)
+
+**设计思路**:
+
+- 验证所有提取方法的签名是否符合规范
+- 检查参数类型、返回类型
+- 确保方法可被调度器正确调用
 
 **检查项**:
 
-- 代码风格（PEP 8）
-- 未使用的导入
-- 冗余注释
-- 方法签名正确性
+1. **参数规范**:
+
+```python
+# 列表页方法
+async def extract_list_from_xxx(page: Optional[Union[str, PageParam]] = None) -> dict
+
+# 详情页方法
+async def extract_detail_from_xxx(page: PageParam) -> dict
+```
+
+2. **返回值规范**:
+
+```python
+# 必须包含的字段
+{
+    'site_name': str,
+    'title': str,
+    'urls': list  # 列表页
+    # 或详情页特定字段
+}
+```
+
+**修复流程**:
+
+- 发现不符合规范的方法
+- 调用 step22 修复代码
+- 重新检查
 
 ---
 
-#### 5.4.2 Step 20.1-20.4: 细分检查
+#### Step 20.4: 检查缺失数据 (`step20_4__check_missing_data`)
 
-- **20.1**: 性能检查（是否使用了BrowserPool、BrightData批量等）
-- **20.2**: 优化函数（移除冗余代码）
-- **20.3**: 检查方法签名（参数、返回值）
-- **20.4**: 检查缺失数据（是否提取了所有必要字段）
+**设计思路**:
+
+- 执行一次小规模爬取
+- 检查提取的数据完整性
+- 识别缺失的关键字段
+
+**检查内容**:
+
+1. **详情页数据**:
+   - 是否有标题
+   - 是否有价格
+   - 是否有图片
+   - 是否有描述
+
+2. **列表页数据**:
+   - URL 是否完整
+   - 类型是否正确
+   - 数量是否合理
+
+**输出**:
+
+```python
+missing_fields = {
+    'extract_product_detail': ['price', 'description'],
+    'extract_list_from_category': []
+}
+```
+
+**修复流程**:
+
+- 有缺失数据: 调用 step22 修复
+- 无缺失: 进入 step20_1 性能检测
 
 ---
 
-#### 5.4.3 Step 21: 性能优化
+#### Step 21: 优化性能 (`step21__optimize_performance`)
+
+**设计思路**:
+
+- 基于 step20_1 的性能报告
+- 综合优化整体性能
+- (当前版本为占位实现)
 
 **优化策略**:
 
-- 启用BrightData批量爬取
 - 调整并发参数
-- 减少不必要的等待时间
+- 优化数据库查询
+- 减少网络请求
+- 使用缓存机制
 
 ---
 
-#### 5.4.4 Step 22: 修复代码
+#### Step 22: 修复代码 (`step22__fix_code`)
 
-**触发条件**: Step 9或Step 20检测到问题。
+**设计思路**:
+
+- 作为修复的统一入口
+- 根据检测结果调用 AI 修复
+- 修复后返回对应的检查步骤
 
 **修复流程**:
 
 ```python
-1. 读取错误日志
-2. 用LLM分析错误原因
-3. 生成修复方案
-4. 应用修复
-5. 跳回到 regenerate_from 指定的步骤（通常是Step 9）
+# 1. 读取错误信息
+regenerate_from = state.get('regenerate_from')  # step20_3 或 step20_4
+
+# 2. 构建修复 prompt
+prompt = f"""
+检测到以下问题:
+{error_description}
+
+请修复代码:
+{code_snippet}
+"""
+
+# 3. 调用 AI 生成修复代码
+result = await call_subagent('crawler-developer', prompt)
+
+# 4. 返回检查步骤重新验证
+return {
+    'regenerate_from': regenerate_from  # 回到 step20_3 或 step20_4
+}
+```
+
+**循环控制**:
+
+- 最多重试 3 次
+- 超过限制则报警并终止
+
+---
+
+### 5.5 辅助设计模式
+
+#### 1. 步骤日志装饰器 (`@step_logger`)
+
+**设计思路**:
+
+- 统一记录步骤开始/结束
+- 自动计算执行耗时
+- 异常自动捕获和记录
+
+**实现**:
+
+```python
+def step_logger(func):
+    @functools.wraps(func)
+    async def wrapper(state, *args, **kwargs):
+        # 从函数名提取步骤信息: step5_1__generate_fetch_rendered_html
+        match = re.match(r'step(\d+)(?:_(\d+))?__(.+)', func.__name__)
+        step_num = f"{match.group(1)}.{match.group(2)}" if match.group(2) else match.group(1)
+        step_name = match.group(3).replace('_', ' ').title()
+
+        logger.info(f"Step {step_num}: {step_name}")
+        start_time = time.time()
+
+        result = await func(state, *args, **kwargs)
+
+        elapsed = time.time() - start_time
+        logger.info(f"✅ Step {step_num} 完成 (耗时 {elapsed:.1f}s)")
+
+        return result
+    return wrapper
 ```
 
 ---
+
+#### 2. Prompt 渲染系统
+
+**设计思路**:
+
+- 使用 Jinja2 模板管理 prompts
+- 支持变量替换和逻辑控制
+- 统一 prompt 风格
+
+**模板变量**:
+
+```python
+context = {
+    'public_prompt': PUBLIC_PROMPT,  # 公共提示词
+    'proj_root_dir': PROJ_ROOT_DIR,
+    'site_name': state['site_name'],
+    'category': state['category'],
+    'base_file_path': state['base_file_path'],
+    'output_dir': output_dir,
+    'output_part_dir': output_part_dir,
+    'tmp_folder': tmp_folder,
+    'attention': attention,  # 额外注意事项
+    **kwargs  # 步骤特定参数
+}
+```
+
+**使用方式**:
+
+```python
+# 1. 定义模板
+_step1_tmpl = r'''{{ public_prompt }}
+
+用 chrome-devtools 访问以下网站:
+{{ url }}
+
+中间文件存放位置:
+{{ tmp_folder }}/
+{{ attention }}
+
+任务步骤:
+1. ...
+'''
+
+# 2. 定义参数函数
+def _step1_kwargs(state):
+    return {
+        'site_capitalize': state['site_name'].capitalize()
+    }
+
+# 3. 渲染 prompt
+prompt = get_step_prompt('step1', state)
+```
+
+---
+
+#### 3. 自动提交机制
+
+**设计思路**:
+
+- 每个步骤完成后自动 Git 提交
+- 便于版本追踪和回滚
+- 提交信息包含步骤名和描述
+
+**实现**:
+
+```python
+def auto_commit_if_enabled(state, step_name, description, extra_files=None):
+    if not conf.devbot.get('auto_commit', True):
+        return
+
+    file_path_list = [
+        state["base_file_path"],  # 代码文件
+        str(output_file_dir),     # 输出目录
+        str(attention_file)       # 注意事项文件
+    ]
+
+    if extra_files:
+        file_path_list.extend(extra_files)
+
+    auto_commit_generated_file(
+        file_path_list=file_path_list,
+        site_name=state['site_name'],
+        step_name=step_name,
+        description=description
+    )
+```
+
+**提交格式**:
+
+```
+[AUTO-GEN] {site_name} - {step_name}: {description}
+
+例如:
+[AUTO-GEN] gnc - step2__generate_list_extractor: 生成列表提取器代码
+```
+
+---
+
+#### 4. 对话记录保存
+
+**设计思路**:
+
+- 保存每次 AI 对话的 prompt 和 response
+- 用于调试和审计
+- 支持长期记忆(Store)
+
+**实现**:
+
+```python
+save_conversation_from_state(
+    state=state,
+    prompt=prompt,
+    response=response_text,
+    node_name="step2_generate_list_extractor",
+    metadata={"agent": "crawler-developer"}
+)
+```
+
+**存储结构**:
+
+```python
+{
+    'session_id': str,
+    'node_name': str,
+    'prompt': str,
+    'response': str,
+    'timestamp': datetime,
+    'metadata': dict
+}
+```
+
+---
+
+#### 5. 循环处理机制
+
+**设计思路**:
+
+- 支持处理多个 URL patterns
+- 队列管理和状态跟踪
+- 条件路由
+
+**队列管理**:
+
+```python
+# 初始化队列
+patterns_queue = build_patterns_queue(state)
+
+# 循环处理
+while patterns_queue:
+    current_pattern = patterns_queue.pop(0)
+
+    if current_pattern['type'] == 'detail':
+        await process_detail_pattern(current_pattern)
+    elif current_pattern['type'] == 'list':
+        await process_list_pattern(current_pattern)
+
+    completed_patterns.append(current_pattern['pattern'])
+```
+
+**LangGraph 实现**:
+
+```python
+# 条件路由函数
+def route_by_pattern_type(state):
+    patterns_queue = state.get("patterns_queue", [])
+
+    if not patterns_queue:
+        return "reviewer_step4"  # 队列为空，进入审查
+
+    current_pattern = patterns_queue[0]
+
+    if current_pattern['type'] == 'detail':
+        return "step5__generate_extractor_class"
+    elif current_pattern['type'] == 'list':
+        return "step6__generate_list_extractor"
+```
+
+---
+
+### 5.6 错误处理和重试
+
+#### 1. SubagentError 处理
+
+**设计思路**:
+
+- AI 调用可能失败(超时、API错误等)
+- 捕获异常并发送告警
+- 标记为已完成(跳过)，继续下一个
+
+**实现**:
+
+```python
+try:
+    result = await call_subagent('crawler-developer', prompt)
+except SubagentError as e:
+    logger.error(f"❌ Subagent 异常: {e}")
+    send_slack_message(
+        f"Step6 执行失败\n站点: {state['site_name']}\n错误: {e}",
+        title="DevBot Step6 告警",
+        level="error"
+    )
+    # 标记为已完成(跳过)
+    completed_patterns.append(current_pattern)
+```
+
+---
+
+#### 2. 重试机制
+
+**设计思路**:
+
+- 某些步骤允许重试(如截图失败)
+- 最多重试固定次数
+- 重试间隔递增
+
+**示例**:
+
+```python
+max_retries = 5
+retry_count = 0
+
+while retry_count < max_retries:
+    try:
+        screenshot = await page.screenshot(full_page=True)
+        break
+    except Exception as e:
+        retry_count += 1
+        if 'DecompressionBombError' in str(e):
+            logger.warning(f"截图异常，重试 {retry_count}/{max_retries}")
+            await page.close()
+            await asyncio.sleep(5)
+            page = await browser.new_page()
+        else:
+            raise
+```
+
+---
+
+#### 3. 验证和修复循环
+
+**设计思路**:
+
+- 检测 → 修复 → 重新检测
+- 最多循环固定次数
+- 防止无限循环
+
+**流程**:
+
+```
+step20_3 检查方法签名
+    ↓ 不通过
+step22 修复代码
+    ↓
+step20_3 重新检查
+    ↓ 通过
+step20_4 检查缺失数据
+```
+
+---
+
+### 5.7 状态管理
+
+#### CrawlerDevState 结构
+
+**设计思路**:
+
+- TypedDict 提供类型安全
+- 包含所有步骤需要的状态信息
+- 支持序列化到 JSON
+
+**核心字段**:
+
+```python
+{
+    # 基本信息
+    'url': str,                    # 目标网站 URL
+    'site_name': str,              # 站点名(如 gnc)
+    'category': str,               # 分类(product/deal/shopping)
+    'proxy': str,                  # 代理地址
+
+    # 步骤控制
+    'current_step': str,           # 当前步骤号(如 "5.1")
+    'current_step_name': str,      # 步骤名(如 "generate_fetch_rendered_html")
+    'status': str,                 # 状态(pending/in_progress/completed/failed)
+    'retry_count': int,            # 重试次数
+
+    # 结果和错误
+    'result': Any,                 # 步骤结果
+    'validation_result': Any,      # 验证结果
+    'error': str,                  # 错误信息
+
+    # Pattern 处理
+    'current_url_pattern': str,    # 当前处理的 pattern
+    'current_sample_url': str,     # 当前样例 URL
+    'completed_patterns': list,    # 已完成的 patterns
+    'patterns_queue': list,        # 待处理的 patterns 队列
+    'current_pattern_info': dict,  # 当前 pattern 详细信息
+
+    # 缓存和临时数据
+    'cache_data': dict,            # 缓存数据(如 site_tree)
+
+    # Step 7 专用
+    'has_new_patterns_in_step7': bool,  # 是否有新 patterns
+    'step7_loop_count': int,            # Step 7 循环次数
+
+    # 文件路径
+    'base_file_path': str,         # 代码文件路径
+    'output_dir': str,             # 输出目录
+    'output_part_dir': str,        # 部分输出目录
+
+    # 会话管理
+    'session_id': str              # Claude AI 会话 ID
+}
+```
+
+---
+
+#### 状态持久化
+
+**设计思路**:
+
+- 每个节点执行后自动保存状态
+- 支持断点续传
+- 状态文件便于人工查看和修改
+
+**保存位置**:
+
+- `crawler/{category}/local_state_{site_name}.json`
+
+**断点续传**:
+
+```python
+# 加载状态
+state = load_state()
+
+if state is None:
+    # 从头开始
+    state = get_initial_state()
+else:
+    # 从断点恢复
+    logger.info(f"从 {state['current_step_name']} 恢复")
+
+# 流式执行
+async for event in app.astream(state, config):
+    # 处理节点
+    save_state(event)
+```
+
+---
+
+### 5.8 工作流可视化
+
+**设计思路**:
+
+- 生成 Mermaid 流程图
+- 可视化节点和边
+- 便于理解工作流结构
+
+**生成方式**:
+
+```bash
+python -m devbot.crawler_devbot --visualize product https://www.gnc.com
+```
+
+**输出**:
+
+- `workflow_graph.mmd` - Mermaid 源码
+- `workflow_graph.png` - PNG 图片(需要 graphviz)
+
+**流程图示例**:
+
+```mermaid
+graph TD
+    step0[Step 0: Create Base File] --> step1[Step 1: Analyze Page]
+    step1 --> step2[Step 2: Generate List Extractor]
+    step2 --> step2_1[Step 2.1: Classify URLs]
+    step2_1 --> step3[Step 3: Generate URL Patterns]
+    ...
+```
+
+---
+
+### 5.9 最佳实践总结
+
+#### 1. 提示词工程
+
+- **结构化**: 使用明确的章节标题和编号
+- **示例驱动**: 提供充分的代码示例
+- **验证要求**: 明确测试命令和期望结果
+- **注意事项**: 突出关键要求(如文件大小限制)
+
+#### 2. 渐进式生成
+
+- **小步快跑**: 每个步骤只完成一个小目标
+- **及时验证**: 每步都有测试和验证
+- **快速反馈**: 发现问题立即修复
+
+#### 3. 可观测性
+
+- **详细日志**: 记录每个步骤的输入输出
+- **状态持久化**: 随时可查看当前进度
+- **可视化**: 流程图直观展示工作流
+- **告警机制**: 关键错误发送 Slack 通知
+
+#### 4. 容错设计
+
+- **异常捕获**: 每个步骤都有异常处理
+- **优雅降级**: 失败时跳过而不是崩溃
+- **重试机制**: 临时性错误自动重试
+- **人工干预**: 状态文件可手动修改
+
+#### 5. 模块化设计
+
+- **单一职责**: 每个步骤只做一件事
+- **解耦合**: 步骤之间通过状态传递数据
+- **可复用**: 公共逻辑提取为函数或装饰器
+- **可扩展**: 新增步骤不影响现有流程
+
+---
+
+### 5.10 总结
+
+DevBot Developer Nodes 通过精心设计的多步骤流程，实现了爬虫代码的自动化生成：
+
+1. **基础搭建** (Step 0-1): 创建框架和分析页面
+2. **URL 处理** (Step 2-3): 提取和分类 URL patterns
+3. **循环生成** (Step 4-6): 为每个 pattern 生成提取代码
+4. **深度扩展** (Step 7): 扩展 URL 树发现新 patterns
+5. **系统集成** (Step 8-10): 完善功能和调度配置
+6. **质量保证** (Step 20-22): 检查和优化代码
+
+整个系统充分利用了 LangGraph 的状态管理和条件路由能力，结合 Claude AI 的代码生成能力，实现了高度自动化的爬虫开发流程。
 
 ## 6. Reviewer 验证机制
 
@@ -2958,15 +3220,6 @@ A: 质量保证体系：
 
 ---
 
-**文档完成时间**: 2025-01-20
-**文档质量**: ⭐⭐⭐⭐⭐ 超详细版
-**总行数**: 约3000+行
-**准备程度**: 100% 面试就绪
-
-**祝面试顺利！** 🚀
-
----
-
 ## 11. WebScraper 爬虫项目架构
 
 ### 11.1 项目概述
@@ -3046,7 +3299,7 @@ class BrowserPool:
 - **自动清理**: 归还tab前清除localStorage，避免状态污染
 - **反检测增强**: 集成 `anti_detection` 模块，修改浏览器指纹
 
-#### 11.2.2 站点适配层 (extractor_<site>.py)
+#### 11.2.2 站点适配层 (extractor_\<site\>.py)
 
 **URL_MAP路由设计**:
 
@@ -3319,6 +3572,69 @@ async def setup_page_anti_detection(page, user_agent=None):
         }};
     }}""")
 ```
+
+**User-Agent 轮换 (User-Agent Rotation)**
+
+User-Agent (UA) 是 HTTP 请求头的一部分，用于告诉服务器“我是谁”。它包含了浏览器类型、版本、操作系统等信息。
+
+为什么要轮换？
+
+规避封锁： 如果一个 IP 地址在短时间内使用相同的 UA 发送大量请求，服务器很容易将其识别为机器人并进行封锁。
+
+- 伪装身份： 许多网站对 Googlebot 或移动端设备有不同的展示策略（例如无需登录即可查看内容），通过伪造 UA 可以获取这些特权。
+
+* 核心技术点：
+
+1. UA 池 (UA Pool)： 维护一个庞大的、真实的 UA 列表（包含 Chrome, Firefox, Safari, iOS, Android 等）。
+2. 随机化策略： 每次请求随机抽取一个 UA。
+3. UA-平台一致性 (重要)：错误示范： UA 声明自己是 "iPhone/Safari"，但后续的 TCP/IP 握手特征或 JavaScript 环境检测（如 navigator.platform）却显示是 "Windows"。这会直接触发风控。进阶技术： 现代反爬虫不仅看 User-Agent 字符串，还会看 Client Hints (Sec-CH-UA)。如果你只改了 UA 字符串，没改 Client Hints，会被轻易识破。
+
+常用工具：
+
+- Python: fake-useragent 库。
+- Scrapy: scrapy-user-agents 中间件。
+- 指纹浏览器（AdsPower 等）自动处理。
+
+**浏览器指纹伪装 (Browser Fingerprinting Spoofing)**
+
+浏览器指纹是由于硬件（显卡、屏幕）、软件（操作系统、字体、驱动）和浏览器设置的不同，在执行特定 JavaScript 代码时产生的唯一标识。即使你清除了 Cookie 和 IP，指纹依然可以追踪你。
+
+常见的指纹维度及伪装手段**：**
+
+1. Canvas 指纹 (Canvas Fingerprinting)：原理：浏览器利用 HTML5 Canvas 绘制特定的图形和文字。由于显卡渲染差异，不同设备生成的像素数据（Base64）是不同的且固定的。伪装： Canvas Noise（注入噪声）。拦截 toDataURL 或 getImageData 方法，在返回的像素数据中随机修改几个像素的值（人眼看不出，但哈希值变了）。
+2. WebGL 指纹：原理： 获取显卡型号（如 Google SwiftShader 通常意味着是无头浏览器）和渲染能力。伪装**：** 覆写 getParameter 方法，伪造显卡型号（如改为 NVIDIA GeForce GTX 3060）。
+3. AudioContext 指纹：原理：处理音频信号时的波形差异。伪装： 类似 Canvas，加入微小的随机噪声。
+4. 特征检测 (Feature Detection)：Webdriver 属性： 自动化工具通常会有 navigator.webdriver = true。伪装技术会将其删除或设为 false。Headless 检测： 无头浏览器（Headless Chrome）在 User-Agent、语言设置、屏幕分辨率上往往有默认特征（如分辨率 800x600）。伪装需要将这些参数调整为常见桌面标准（如 1920x1080）。
+
+常用工具：
+
+- Puppeteer**-**extra-plugin-stealth / Playwright-stealth： 最流行的开源库，用于自动抹除自动化特征。
+- 指纹浏览器： 商业软件，底层修改 Chromium 内核，实现物理隔离级别的指纹伪装。
+
+**CSP 移除 (CSP Removal)**
+
+CSP (Content Security Policy，内容安全策略) 是网页通过 HTTP 响应头告诉浏览器：“只允许加载来自域名 A 和 B 的脚本，其他都拦截”。这是一种安全机制，用于防止 XSS 攻击。
+
+为什么要移除 CSP？
+
+在爬虫或自动化测试场景中，你可能需要向页面注入自己的 JavaScript 代码（Payload）来实现以下功能：
+
+- 自动操作： 点击按钮、填写表单。
+- 数据提取： 遍历 DOM 树提取数据。
+- Hook 函数： 拦截请求签名生成逻辑。
+
+如果目标网站开启了严格的 CSP（例如 script-src 'self'），你注入的 JS 代码（通常被视为 inline script）会被浏览器拦截，导致无法执行。
+
+如何实现？
+
+这通常在中间人（MITM）层面或浏览器自动化控制层面完成：
+
+1. 使用 Puppeteer**/**Playwright请求拦截：
+   你可以开启请求拦截功能，在浏览器接收到响应头（Response Headers）但尚未渲染页面时，将 Content-Security-Policy 头删除或修改为宽松策略。codeJavaScript`// Puppeteer 示例思路 await page.setRequestInterception(true); page.on('response', response => {    const headers = response.headers();    // 删除 CSP 头    delete headers['content-security-policy'];    delete headers['content-security-policy-report-only'];    // 继续处理... });`*(注：Puppeteer 原生修改 Response Headers 比较麻烦，通常配合 CDP Session 或 puppeteer-extra-plugin-anonymize-ua 等类似插件实现)*
+2. 使用代理工具 (Mitmproxy / Fiddler)：
+   在流量经过代理服务器时，编写脚本自动剥离 Response 中的 CSP 头部。
+3. 浏览器插件：
+   有一些 Chrome 插件（如 Disable Content-Security-Policy）可以直接在浏览器端禁用该策略（主要用于调试）。
 
 #### 难点2: 动态内容加载
 
